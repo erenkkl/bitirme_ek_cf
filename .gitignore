@@ -62,6 +62,10 @@ venv/
 env/
 .env
 
-
+**/[Ll]ibrary/
+**/[Tt]emp/
+**/[Oo]bj/
+**/[Ll]ogs/
+**/[Uu]ser[Ss]ettings/
 EOF
 
