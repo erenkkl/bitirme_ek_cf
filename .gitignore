@@ -1,0 +1,135 @@
+############################################################
+# Repo layout:
+#   /Bitirme      -> Unity project (keep Assets, Packages, ProjectSettings)
+#   /ros2_ws      -> ROS2 workspace (keep src only)
+############################################################
+
+########################
+# OS / Editor noise
+########################
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+########################
+# Unity (Bitirme/)
+# Keep:
+#   Bitirme/Assets
+#   Bitirme/Packages
+#   Bitirme/ProjectSettings
+########################
+
+# Unity generated folders (ignore)
+Bitirme/[Ll]ibrary/
+Bitirme/[Tt]emp/
+Bitirme/[Oo]bj/
+Bitirme/[Bb]uild/
+Bitirme/[Bb]uilds/
+Bitirme/[Ll]ogs/
+Bitirme/[Uu]ser[Ss]ettings/
+Bitirme/[Mm]emoryCaptures/
+Bitirme/[Rr]ecordings/
+
+# Unity logs / tmp
+Bitirme/*.log
+Bitirme/.utmp/
+
+# Crash dumps / reports
+Bitirme/sysinfo.txt
+Bitirme/mono_crash.*
+Bitirme/*.blob
+
+# Blender backups
+Bitirme/*.blend1
+Bitirme/*.blend1.meta
+
+# Rider / JetBrains
+Bitirme/[Aa]ssets/Plugins/Editor/JetBrains*
+Bitirme/*.DotSettings.user
+
+# Visual Studio / MSBuild generated
+Bitirme/.vs/
+Bitirme/ExportedObj/
+Bitirme/.consulo/
+Bitirme/*.csproj
+Bitirme/*.unityproj
+Bitirme/*.sln
+Bitirme/*.suo
+Bitirme/*.tmp
+Bitirme/*.user
+Bitirme/*.userprefs
+Bitirme/*.pidb
+Bitirme/*.booproj
+Bitirme/*.svd
+Bitirme/*.pdb
+Bitirme/*.mdb
+Bitirme/*.opendb
+Bitirme/*.VC.db
+
+# Unity3D generated meta files (safe to ignore)
+Bitirme/*.pidb.meta
+Bitirme/*.pdb.meta
+Bitirme/*.mdb.meta
+
+# Builds / packages
+Bitirme/*.apk
+Bitirme/*.aab
+Bitirme/*.app
+Bitirme/*.unitypackage
+Bitirme/*.unitypackage.meta
+
+# Addressables build outputs (if you use Addressables)
+Bitirme/ServerData/
+Bitirme/[Aa]ssets/StreamingAssets/aa*
+Bitirme/[Aa]ssets/AddressableAssetsData/link.xml*
+Bitirme/[Aa]ssets/Addressables_Temp*
+Bitirme/[Aa]ssets/AddressableAssetsData/*/*.bin*
+
+# Visual Scripting auto-generated
+Bitirme/[Aa]ssets/Unity.VisualScripting.Generated/
+
+# IMPORTANT: Unity .meta files are REQUIRED → do NOT ignore *.meta
+
+########################
+# Dataset (Bitirme/bitirme_dataset)
+# Recommended: ignore (usually huge)
+########################
+Bitirme/bitirme_dataset/
+
+########################
+# ROS 2 workspace (ros2_ws/)
+# Keep only: ros2_ws/src
+########################
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+########################
+# Python (ROS nodes/tools)
+########################
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+env/
+.env
+
+########################
+# Large recordings (optional)
+########################
+*.bag
+*.db3
+*.sqlite
+*.mp4
+*.avi
+*.mov
+*.mkv
