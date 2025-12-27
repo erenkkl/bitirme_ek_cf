@@ -1,0 +1,67 @@
+cat > .gitignore <<'EOF'
+############################################################
+# Repo layout:
+#   /Bitirme   -> Unity project (track Assets, Packages, ProjectSettings)
+#   /ros2_ws   -> ROS2 workspace (track src only)
+############################################################
+
+########################
+# Unity (Bitirme/) generated folders
+########################
+Bitirme/[Ll]ibrary/
+Bitirme/[Tt]emp/
+Bitirme/[Oo]bj/
+Bitirme/[Bb]uild/
+Bitirme/[Bb]uilds/
+Bitirme/[Ll]ogs/
+Bitirme/[Uu]ser[Ss]ettings/
+Bitirme/[Mm]emoryCaptures/
+Bitirme/[Rr]ecordings/
+Bitirme/*.log
+Bitirme/.utmp/
+Bitirme/sysinfo.txt
+Bitirme/mono_crash.*
+Bitirme/*.blob
+
+# IDE
+Bitirme/.vs/
+Bitirme/ExportedObj/
+Bitirme/.consulo/
+Bitirme/*.csproj
+Bitirme/*.sln
+Bitirme/*.suo
+Bitirme/*.tmp
+Bitirme/*.user
+Bitirme/*.userprefs
+Bitirme/*.opendb
+Bitirme/*.VC.db
+
+# Builds/packages (genelde repoya koyma)
+Bitirme/*.apk
+Bitirme/*.aab
+Bitirme/*.app
+Bitirme/*.unitypackage
+Bitirme/*.unitypackage.meta
+
+# IMPORTANT: Unity .meta dosyaları gerekli → ignore ETME
+
+########################
+# ROS 2 (keep src only)
+########################
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+########################
+# Python
+########################
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+
+EOF
+
