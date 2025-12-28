@@ -16,7 +16,7 @@ def main():
             sys.exit(1)
 
     # Defaults (env ile override edebilirsin)
-    csv_path   = os.environ.get("CSV", "/home/eren/Bitirme/bitirme_dataset/references.csv")
+    csv_path   = os.environ.get("CSV", "/home/eren/bitirme_repo/bitirme_dataset/references.csv")
     frame_id   = os.environ.get("FRAME", "map")
 
     # Live kaynak seçimi:

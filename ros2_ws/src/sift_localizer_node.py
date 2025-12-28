@@ -15,7 +15,7 @@ class SiftLocalizerNodeV2(Node):
         super().__init__('sift_localizer_node')
 
         # --- Parameters ---
-        self.declare_parameter('reference_csv_path', '/home/eren/Bitirme/bitirme_dataset/references.csv')
+        self.declare_parameter('reference_csv_path', '/home/eren/bitirme_repo/bitirme_dataset/references.csv')
         self.declare_parameter('image_topic', '/drone/camera/bottom')
         self.declare_parameter('pose_topic', '/drone/sift_pose')
         self.declare_parameter('debug_visualization', False)

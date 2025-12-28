@@ -14,6 +14,10 @@ public class SiftPathFollower : MonoBehaviour
     public DronePhysics drone;
     public Transform droneTransform;
 
+    [Header("Control Arbitration")]
+    [Tooltip("Arbiter (Obstacle Avoidance vb.) bu flag'i false yaparsa follower komut basmaz.")]
+    public bool controlEnabled = true;
+
     [Header("Navigation Parameters")]
     public int lookAhead = 10;          // Hedefin kaç frame ileride olduğu
     [Range(0f, 1f)]
@@ -186,6 +190,9 @@ public class SiftPathFollower : MonoBehaviour
     // Fizik ve Kontrol Döngüsü
     void FixedUpdate()
     {
+        // Arbiter OA aktifken follower komut basmamalı (çakışma önlenir)
+        if (!controlEnabled) return;
+
         if (!isInitialized || drone == null) return;
 
         float pitchCmd = 0;
@@ -239,11 +246,8 @@ public class SiftPathFollower : MonoBehaviour
             yawCmd = Mathf.Clamp(targetAngle * yawGain, -drone.maxYawTorqueCmd, drone.maxYawTorqueCmd);
 
             // 2. Pitch (İleri/Geri) ve Roll (Sağ/Sol)
-            // localError.z pozitifse hedef öndedir -> Pitch (İleri git)
-            // localError.x pozitifse hedef sağdadır -> Roll (Sağa yat)
-            
             pitchCmd = Mathf.Clamp(localError.z * lateralGain, -maxTiltDeg, maxTiltDeg);
-            rollCmd = Mathf.Clamp(localError.x * lateralGain, -maxTiltDeg, maxTiltDeg);
+            rollCmd  = Mathf.Clamp(localError.x * lateralGain, -maxTiltDeg, maxTiltDeg);
 
             // Komutları Drone Fiziğine Gönder
             drone.SetExternalCommand(pitchCmd, rollCmd, yawCmd);
@@ -262,3 +266,4 @@ public class SiftPathFollower : MonoBehaviour
         }
     }
 }
+

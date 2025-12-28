@@ -10,7 +10,7 @@ class ReferencePathPublisher(Node):
     def __init__(self):
         super().__init__('reference_path_publisher')
 
-        self.declare_parameter('reference_csv_path', '/home/eren/Bitirme/bitirme_dataset/references.csv')
+        self.declare_parameter('reference_csv_path', '/home/eren/bitirme_repo/bitirme_dataset/references.csv')
         self.declare_parameter('output_topic', '/trajectory/reference')
         self.declare_parameter('frame_id', 'map')
         self.declare_parameter('publish_hz', 1.0)
