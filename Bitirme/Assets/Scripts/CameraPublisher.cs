@@ -51,7 +51,7 @@ public class CameraPublisher : MonoBehaviour
     void Start()
     {
         cam = GetComponent<Camera>();
-
+	
         // Basit doğrulamalar
         width = Mathf.Max(16, width);
         height = Mathf.Max(16, height);

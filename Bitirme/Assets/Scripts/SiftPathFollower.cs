@@ -6,264 +6,456 @@ using RosMessageTypes.Std;
 
 public class SiftPathFollower : MonoBehaviour
 {
+    // Mission state enum
+    private enum MissionState
+    {
+        FLYING,
+        ARRIVED,
+        LANDING,
+        COMPLETED
+    }
+
     [Header("ROS Settings")]
     public string poseTopic = "/drone/sift_pose";
-    public string referencesCsvPath = "/home/fidan/bitirme_dataset/references.csv";
+    public string avoidanceCommandTopic = "/drone/avoidance_command";
+    public string referencesCsvPath = "/home/eren/bitirme_repo/bitirme_dataset/references.csv";
 
-    [Header("Drone References")]
+    [Header("Drone Components")]
     public DronePhysics drone;
-    public Transform droneTransform;
 
-    [Header("Control Arbitration")]
-    [Tooltip("Arbiter (Obstacle Avoidance vb.) bu flag'i false yaparsa follower komut basmaz.")]
-    public bool controlEnabled = true;
+    [Header("Navigation")]
+    public float lookAhead = 4.0f;
+    public float baseLookAhead = 4.0f; // Store original value
 
-    [Header("Navigation Parameters")]
-    public int lookAhead = 10;          // Hedefin kaç frame ileride olduğu
+    [Header("Obstacle Avoidance Integration")]
+    [Tooltip("Enable obstacle avoidance integration")]
+    public bool enableAvoidance = true;
+
+    [Tooltip("Blending factor for avoidance roll (0=ignore, 1=full)")]
     [Range(0f, 1f)]
-    public float minConfidence = 0.4f;  // Güven eşiği (0.35'ten 0.4'e çektik, daha güvenli olsun)
-    
-    [Header("Safety & Filters")]
-    public bool maxAllowedJumpActive = true;
-    public float maxSeqJump = 50f;      // Ani frame atlaması limiti
-    public int jumpTimeOutFrames = 5;   // KAÇ KEZ ısrar ederse zıplamayı kabul edelim? (YENİ)
-    public int seqWindowSize = 3;       // Gecikme olmasın diye 3'e düşürdük
+    public float avoidanceBlendFactor = 0.7f;
 
-    [Header("Control Gains")]
-    public float yawGain = 1.0f;
-    public float lateralGain = 1.2f;
-    public float maxTiltDeg = 20f;      // 25 biraz sertti, 20 daha stabil yapar
+    [Tooltip("Smoothing for avoidance transitions")]
+    public float avoidanceSmoothness = 5.0f;
+
+    [Header("Safety Filters")]
+    public bool useSmoothing = true;
+    public int seqWindowSize = 2;
+    
+    [Header("Control Settings")]
+    public float forwardSpeed = 15.0f;    
+    public float yawGain = 1.0f;         
+    public float visualGainX = 0.05f;    // Lateral Düzeltme Gücü
+    public bool invertRoll = true;      
+    public float deadband = 10.0f;       // Titreşim Önleyici Eşik
+
+    [Header("Landing Settings")]
+    [Tooltip("Descent speed in m/s when landing")]
+    public float descentSpeed = 5.0f;
+    [Tooltip("Ground altitude threshold to consider mission completed")]
+    public float groundAltitude = 0.5f;
+
+    [Header("Mission UI")]
+    public MissionCompleteUI missionCompleteUI;
 
     [Header("Debug")]
     public bool debugLogs = true;
-    public float debugLogPeriod = 0.5f; // Saniyede 2 kere log basar
+    public float debugLogPeriod = 0.5f;
 
     // --- Internal State ---
     private ROSConnection ros;
-    private List<Vector3> referencePath = new List<Vector3>();
+    private List<Vector3> mapPoints = new List<Vector3>();
     private Queue<float> seqHistory = new Queue<float>();
-    
-    // Anlık Veriler
-    private Vector3 currentEstPos = Vector3.zero;
-    private float currentSeq = -1;
-    private float rawSeq = -1;
-    private float currentConf = 0;
-    
-    // Zıplama (Jump) Sayacı
-    private int jumpRejectionCounter = 0; 
 
-    // Log Zamanlayıcısı
+    private float rawSeq = -1;
+    private float visualErrX = 0;
+
+    private float estimatedSeq = -1;
+    private float effectiveErrorX = 0;
     private float lastLogTime;
     private bool isInitialized = false;
+
+    // Mission state tracking
+    private MissionState currentState = MissionState.FLYING;
+    private float missionStartTime = 0f;
+    private float flightDuration = 0f;
+
+    // Avoidance command state
+    private bool avoidanceActive = false;
+    private float avoidanceRollAdjustment = 0f;
+    private float avoidanceSpeedMultiplier = 1f;
+    private int avoidanceMode = 0; // 0=normal, 1=avoiding, 2=recovering
+    private float avoidanceLookAheadMult = 1f;
+
+    // Smoothed avoidance values
+    private float currentAvoidanceRoll = 0f;
 
     void Start()
     {
         if (drone == null) drone = GetComponent<DronePhysics>();
-        if (droneTransform == null && drone != null) droneTransform = drone.transform;
+        if (drone != null) drone.useGPS = false; 
 
-        // GPS'i kapat, tamamen SIFT'e güveneceğiz
-        if (drone != null) drone.useGPS = false;
-
-        LoadReferenceCSV();
+        LoadReferenceMap();
 
         ros = ROSConnection.GetOrCreateInstance();
         ros.Subscribe<Float32MultiArrayMsg>(poseTopic, OnPoseReceived);
 
+        // Subscribe to avoidance commands
+        if (enableAvoidance)
+        {
+            ros.Subscribe<Float32MultiArrayMsg>(avoidanceCommandTopic, OnAvoidanceCommandReceived);
+            Debug.Log("[SiftPathFollower] Obstacle avoidance integration enabled.");
+        }
+
+        // Initialize mission tracking
+        missionStartTime = Time.time;
+        currentState = MissionState.FLYING;
+        baseLookAhead = lookAhead; // Store original
+
         isInitialized = true;
-        Debug.Log("[SiftPathFollower] Başlatıldı. Veri bekleniyor...");
+        Debug.Log("[SiftPathFollower] Hazır. Mission started.");
     }
 
-    // CSV Okuma (Sadece Konum İçin)
-    void LoadReferenceCSV()
+    void OnPoseReceived(Float32MultiArrayMsg msg)
     {
-        referencePath.Clear();
-        if (!File.Exists(referencesCsvPath))
+        if (msg.data.Length < 2) return;
+
+        rawSeq = msg.data[0]; 
+        visualErrX = msg.data[1];
+
+        // KayÄ±p Durumu (-1)
+        if (rawSeq == -1)
         {
-            Debug.LogError($"[SiftPathFollower] CSV Bulunamadı: {referencesCsvPath}");
+            estimatedSeq = -1;
+            seqHistory.Clear();
             return;
         }
 
-        try
+        // Smoothing (YumuÅŸatma)
+        if (useSmoothing)
         {
-            string[] lines = File.ReadAllLines(referencesCsvPath);
-            // Header atla (i=1)
-            for (int i = 1; i < lines.Length; i++)
-            {
-                string line = lines[i];
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                string[] parts = line.Split(',');
-                
-                if (parts.Length >= 4)
-                {
-                    // CSV formatı: seq, x, y, z, img_path
-                    float x = float.Parse(parts[1]);
-                    float y = float.Parse(parts[2]);
-                    float z = float.Parse(parts[3]);
-                    referencePath.Add(new Vector3(x, y, z));
-                }
-            }
-            Debug.Log($"[SiftPathFollower] {referencePath.Count} waypoint yüklendi.");
+            seqHistory.Enqueue(rawSeq);
+            if (seqHistory.Count > seqWindowSize) seqHistory.Dequeue();
+            float sum = 0;
+            foreach (float s in seqHistory) sum += s;
+            estimatedSeq = sum / seqHistory.Count;
         }
-        catch (System.Exception e)
+        else estimatedSeq = rawSeq;
+    }
+
+    void OnAvoidanceCommandReceived(Float32MultiArrayMsg msg)
+    {
+        if (msg.data.Length < 5) return;
+
+        avoidanceActive = msg.data[0] > 0.5f;
+        avoidanceRollAdjustment = msg.data[1];
+        avoidanceSpeedMultiplier = msg.data[2];
+        avoidanceMode = Mathf.RoundToInt(msg.data[3]);
+        avoidanceLookAheadMult = msg.data[4];
+    }
+
+    void FixedUpdate()
+    {
+        if (!isInitialized || drone == null || mapPoints.Count == 0) return;
+
+        // Handle different mission states
+        switch (currentState)
         {
-            Debug.LogError($"[SiftPathFollower] CSV Hatası: {e.Message}");
+            case MissionState.FLYING:
+                HandleFlyingState();
+                break;
+
+            case MissionState.ARRIVED:
+                HandleArrivedState();
+                break;
+
+            case MissionState.LANDING:
+                HandleLandingState();
+                break;
+
+            case MissionState.COMPLETED:
+                // Mission complete - do nothing
+                break;
         }
     }
 
-    // ROS Callback
-    void OnPoseReceived(Float32MultiArrayMsg msg)
+    private void HandleFlyingState()
     {
-        // msg.data = [x, y, z, seq, confidence, match_count]
-        if (msg.data.Length < 6) return;
-
-        float x = msg.data[0];
-        float y = msg.data[1];
-        float z = msg.data[2];
-        float incomingSeq = msg.data[3];
-        float conf = msg.data[4];
-        
-        // Sadece loglama için sakla
-        rawSeq = incomingSeq; 
-
-        // 1. Güven Kontrolü (Confidence Check)
-        if (conf < minConfidence)
+        // --- 1. LOST DURUMU ---
+        if (estimatedSeq == -1 || rawSeq == -1)
         {
-            currentConf = conf; // Düşük güven olduğunu bilmek için kaydet
-            return; // Pozisyonu güncelleme, son bilinen yerde kal
-        }
-
-        // 2. Akıllı Zıplama Kontrolü (Smart Jump Logic)
-        bool acceptData = true;
-
-        if (maxAllowedJumpActive && currentSeq >= 0)
-        {
-            float jumpDiff = Mathf.Abs(incomingSeq - currentSeq);
-
-            if (jumpDiff > maxSeqJump)
+            // NEW: If avoidance is active (especially RECOVERING), keep executing recovery commands
+            // This helps drone return to path where SIFT can reacquire
+            if (enableAvoidance && avoidanceActive && avoidanceMode == 2) // RECOVERING mode
             {
-                // Ani zıplama tespit edildi!
-                jumpRejectionCounter++;
-
-                if (jumpRejectionCounter < jumpTimeOutFrames)
+                // Continue with recovery commands even when SIFT lost
+                // This allows drone to fly back toward path to reacquire SIFT
+                if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
                 {
-                    // Henüz limit dolmadı, bu veriyi "gürültü" say ve reddet
-                    acceptData = false;
+                    lastLogTime = Time.time;
+                    Debug.LogWarning("[LOST+RECOVERING] SIFT lost but continuing recovery to reacquire path...");
                 }
-                else
-                {
-                    // Limit doldu! Demek ki gerçekten oradayız (Israrcı Hata kuralı)
-                    Debug.LogWarning($"[SiftPathFollower] BÜYÜK ZIPLAMA KABUL EDİLDİ! (Diff: {jumpDiff})");
-                    
-                    // Eski filtre geçmişini temizle ki yeni konuma hemen adapte olsun
-                    seqHistory.Clear();
-                    jumpRejectionCounter = 0;
-                    acceptData = true;
-                }
+                // Don't return - continue to apply avoidance recovery commands below
             }
             else
             {
-                // Zıplama yok, her şey normal. Sayacı sıfırla.
-                jumpRejectionCounter = 0;
-                acceptData = true;
+                // Not in recovery - safe to stop
+                drone.SetExternalCommand(0, 0, 0);
+
+                if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
+                {
+                    lastLogTime = Time.time;
+                    Debug.LogWarning("[LOST] Harita Kayip! Bekleniyor...");
+                }
+                return;
             }
         }
-
-        if (acceptData)
-        {
-            // Pozisyonu hafif yumuşatarak al (Lerp) - Titremeyi azaltır
-            Vector3 newPos = new Vector3(x, y, z);
-            if (currentEstPos == Vector3.zero) currentEstPos = newPos;
-            else currentEstPos = Vector3.Lerp(currentEstPos, newPos, 0.5f); // %50 yeni, %50 eski
-
-            currentConf = conf;
-
-            // Hareketli Ortalama (Moving Average) Filtresi
-            seqHistory.Enqueue(incomingSeq);
-            if (seqHistory.Count > seqWindowSize) seqHistory.Dequeue();
-
-            float sum = 0;
-            foreach (float s in seqHistory) sum += s;
-            currentSeq = sum / seqHistory.Count;
-        }
-    }
-
-    // Fizik ve Kontrol Döngüsü
-    void FixedUpdate()
-    {
-        // Arbiter OA aktifken follower komut basmamalı (çakışma önlenir)
-        if (!controlEnabled) return;
-
-        if (!isInitialized || drone == null) return;
 
         float pitchCmd = 0;
         float rollCmd = 0;
         float yawCmd = 0;
-        string statusTag = "WAIT";
+        string stateTag = "FLYING";
+        string dirStr = "MERKEZ";
 
-        // Güvenlik Kontrolleri
-        if (referencePath.Count == 0 || currentSeq < 0)
+        // --- AVOIDANCE INTEGRATION ---
+        // Smooth avoidance roll transitions
+        if (enableAvoidance && avoidanceActive)
         {
-            statusTag = "NO_DATA";
-            drone.SetExternalCommand(0, 0, 0); // Hover
-        }
-        else if (currentConf < minConfidence)
-        {
-            statusTag = "LOW_CONF"; // Güven düşük, yerinde dur
-            drone.SetExternalCommand(0, 0, 0);
+            currentAvoidanceRoll = Mathf.Lerp(currentAvoidanceRoll, avoidanceRollAdjustment,
+                                               Time.fixedDeltaTime * avoidanceSmoothness);
+
+            // Update look-ahead dynamically
+            lookAhead = baseLookAhead * avoidanceLookAheadMult;
+
+            // Update state tag for logging
+            if (avoidanceMode == 1)
+                stateTag = "AVOIDING";
+            else if (avoidanceMode == 2)
+                stateTag = "RECOVERING";
+            else if (avoidanceMode == 3)
+                stateTag = "EMERGENCY";
         }
         else
         {
-            statusTag = "FLYING";
-
-            // --- Hedef Belirleme ---
-            int targetIndex = Mathf.FloorToInt(currentSeq) + lookAhead;
-            // Dizi dışına taşmayı önle
-            targetIndex = Mathf.Clamp(targetIndex, 0, referencePath.Count - 1);
-
-            // Son noktaya geldik mi?
-            if (targetIndex >= referencePath.Count - 5) statusTag = "ARRIVED";
-
-            Vector3 targetPos = referencePath[targetIndex];
-            
-            // Hata Vektörü (Hedef - Ben)
-            Vector3 errorVec = targetPos - currentEstPos;
-            
-            // Yüksekliği (Y) yoksay, sadece yatay düzlem (X,Z)
-            Vector3 errorFlat = Vector3.ProjectOnPlane(errorVec, Vector3.up);
-
-            // Drone'un burnu nereye bakıyor? (Yaw)
-            float droneYaw = droneTransform.eulerAngles.y;
-            Quaternion rot = Quaternion.Euler(0, droneYaw, 0);
-
-            // Hata vektörünü Dünya'dan Drone'un Yerel (Local) eksenine çevir
-            // Böylece: Z=İleri Hata, X=Sağ Hata olur.
-            Vector3 localError = Quaternion.Inverse(rot) * errorFlat;
-
-            // --- Kontrol Yasası (P-Controller) ---
-
-            // 1. Yaw (Burun) Kontrolü: Hedefe dön
-            float targetAngle = Mathf.Atan2(localError.x, localError.z) * Mathf.Rad2Deg;
-            yawCmd = Mathf.Clamp(targetAngle * yawGain, -drone.maxYawTorqueCmd, drone.maxYawTorqueCmd);
-
-            // 2. Pitch (İleri/Geri) ve Roll (Sağ/Sol)
-            pitchCmd = Mathf.Clamp(localError.z * lateralGain, -maxTiltDeg, maxTiltDeg);
-            rollCmd  = Mathf.Clamp(localError.x * lateralGain, -maxTiltDeg, maxTiltDeg);
-
-            // Komutları Drone Fiziğine Gönder
-            drone.SetExternalCommand(pitchCmd, rollCmd, yawCmd);
+            // Smoothly return to zero when avoidance deactivates
+            currentAvoidanceRoll = Mathf.Lerp(currentAvoidanceRoll, 0f, Time.fixedDeltaTime * avoidanceSmoothness);
+            lookAhead = baseLookAhead; // Reset to base
         }
 
-        // --- Düzenli Loglama ---
+        // --- 2. HESAPLAMALAR ---
+
+        // NEW: If SIFT lost but in RECOVERING mode, provide basic movement to help reacquire
+        bool siftLost = (estimatedSeq == -1 || rawSeq == -1);
+
+        if (siftLost && enableAvoidance && avoidanceActive && avoidanceMode == 2)
+        {
+            // SIFT lost during recovery - use simple forward motion
+            // Roll will be controlled by avoidance commands below
+            pitchCmd = forwardSpeed * avoidanceSpeedMultiplier; // Keep moving forward slowly
+            rollCmd = 0; // Will be overridden by avoidance blend
+            yawCmd = 0; // Maintain current heading
+
+            stateTag = "RECOVERING-BLIND";
+            dirStr = "NO-SIFT";
+        }
+        else if (!siftLost)
+        {
+            // Normal SIFT-based navigation
+
+            // Deadband & Yön Etiketi
+            if (Mathf.Abs(visualErrX) > deadband)
+            {
+                if (visualErrX > 0)
+                {
+                    effectiveErrorX = visualErrX - deadband;
+                    dirStr = "SAG (>>)";
+                }
+                else
+                {
+                    effectiveErrorX = visualErrX + deadband;
+                    dirStr = "SOL (<<)";
+                }
+            }
+            else
+            {
+                effectiveErrorX = 0;
+                dirStr = "MERKEZ";
+            }
+
+            // Roll Komutu
+            rollCmd = effectiveErrorX * visualGainX;
+            if (invertRoll) rollCmd = -rollCmd;
+
+            // ARRIVED Kontrolü & State Transition
+            if (estimatedSeq >= mapPoints.Count - lookAhead)
+            {
+                stateTag = "ARRIVED";
+                pitchCmd = 0;
+
+                // Transition to ARRIVED state
+                currentState = MissionState.ARRIVED;
+                Debug.Log("[SiftPathFollower] Mission target reached. Transitioning to ARRIVED state.");
+            }
+            else
+            {
+                // Apply speed multiplier from avoidance (if active)
+                float baseSpeed = forwardSpeed;
+                if (enableAvoidance && avoidanceActive)
+                {
+                    baseSpeed *= avoidanceSpeedMultiplier;
+                }
+                pitchCmd = baseSpeed;
+            }
+
+            // Yaw Komutu
+            Vector3 virtualPos = GetInterpolatedPoint(estimatedSeq);
+            Vector3 targetPos = GetInterpolatedPoint(estimatedSeq + lookAhead);
+            Vector3 pathVec = targetPos - virtualPos;
+
+            if (pathVec.sqrMagnitude > 0.01f)
+            {
+                float targetHead = Mathf.Atan2(pathVec.x, pathVec.z) * Mathf.Rad2Deg;
+                float currentYaw = transform.eulerAngles.y;
+                float yawErr = Mathf.DeltaAngle(currentYaw, targetHead);
+                yawCmd = Mathf.Clamp(yawErr * yawGain, -drone.maxYawTorqueCmd, drone.maxYawTorqueCmd);
+            }
+        }
+
+        // --- BLEND SIFT + AVOIDANCE ROLL ---
+        if (enableAvoidance && avoidanceActive)
+        {
+            // Blend SIFT correction with avoidance command
+            float siftRoll = rollCmd;
+            float blendedRoll = 0f;
+
+            if (avoidanceMode == 1) // AVOIDING
+            {
+                // During avoidance, prioritize obstacle avoidance but keep some SIFT correction
+                blendedRoll = siftRoll * (1f - avoidanceBlendFactor) + currentAvoidanceRoll * avoidanceBlendFactor;
+            }
+            else if (avoidanceMode == 2) // RECOVERING
+            {
+                // During recovery, blend more gently to help SIFT reacquire path
+                blendedRoll = siftRoll * 0.7f + currentAvoidanceRoll * 0.3f;
+            }
+            else if (avoidanceMode == 3) // EMERGENCY STOP
+            {
+                // Emergency: zero roll, just stop
+                blendedRoll = 0f;
+                pitchCmd = 0f; // Override pitch too
+            }
+            else // NORMAL (shouldn't happen if avoidanceActive, but safe fallback)
+            {
+                blendedRoll = siftRoll;
+            }
+
+            rollCmd = blendedRoll;
+        }
+
+        // Komutları Uygula
+        rollCmd = Mathf.Clamp(rollCmd, -20f, 20f);
+        drone.SetExternalCommand(pitchCmd, rollCmd, yawCmd);
+
+        // --- 3. LOGLAMA ---
         if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
         {
             lastLogTime = Time.time;
-            Debug.Log($"[{statusTag}] " +
-                      $"Seq: {currentSeq:F0} (Raw:{rawSeq:F0}) | " +
-                      $"Target: {(int)(currentSeq + lookAhead)} | " +
-                      $"Conf: {currentConf:F2} | " +
-                      $"Cmd: (P:{pitchCmd:F1}, R:{rollCmd:F1}, Y:{yawCmd:F1}) | " +
-                      $"RejCount: {jumpRejectionCounter}");
+            float targetSeq = estimatedSeq + lookAhead;
+
+            if (enableAvoidance && avoidanceActive)
+            {
+                Debug.Log($"[{stateTag}] Seq:{estimatedSeq:F0} > Target:{targetSeq:F0} | {dirStr} Err:{visualErrX:F1} | " +
+                          $"AvoidRoll:{currentAvoidanceRoll:F1}° SpeedMult:{avoidanceSpeedMultiplier:F2} | Cmd:(P{pitchCmd:F0}, R{rollCmd:F1})");
+            }
+            else
+            {
+                Debug.Log($"[{stateTag}] Seq:{estimatedSeq:F0} > Target:{targetSeq:F0} | {dirStr} Err:{visualErrX:F1} | Cmd:(P{pitchCmd:F0}, R{rollCmd:F1})");
+            }
         }
     }
-}
 
+    private void HandleArrivedState()
+    {
+        // Stop all movement
+        drone.SetExternalCommand(0, 0, 0);
+        
+        // Transition to landing after brief hover
+        currentState = MissionState.LANDING;
+        Debug.Log("[SiftPathFollower] Starting landing sequence.");
+    }
+
+    private void HandleLandingState()
+    {
+        // Keep drone stable (no pitch/roll/yaw)
+        drone.SetExternalCommand(0, 0, 0);
+
+        // Gradually descend by reducing target altitude
+        if (drone.targetAltitude > groundAltitude)
+        {
+            drone.targetAltitude -= descentSpeed * Time.fixedDeltaTime;
+            drone.targetAltitude = Mathf.Max(drone.targetAltitude, groundAltitude);
+
+            if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
+            {
+                lastLogTime = Time.time;
+                Debug.Log($"[LANDING] Descending... Altitude: {transform.position.y:F2}m | Target: {drone.targetAltitude:F2}m");
+            }
+        }
+        else
+        {
+            // Landing complete
+            CompleteMission();
+        }
+    }
+
+    private void CompleteMission()
+    {
+        currentState = MissionState.COMPLETED;
+        
+        // Calculate flight duration
+        flightDuration = Time.time - missionStartTime;
+        
+        Debug.Log($"[SiftPathFollower] Mission COMPLETED! Flight duration: {flightDuration:F2} seconds");
+
+        // Show mission complete UI
+        if (missionCompleteUI != null)
+        {
+            missionCompleteUI.ShowWithDuration(flightDuration);
+        }
+        else
+        {
+            Debug.LogWarning("[SiftPathFollower] MissionCompleteUI reference is missing!");
+        }
+
+        // Disable drone control
+        drone.SetExternalCommand(0, 0, 0);
+        
+        // Optionally disable this component
+        // enabled = false;
+    }
+
+    Vector3 GetInterpolatedPoint(float seqIndex)
+    {
+        seqIndex = Mathf.Clamp(seqIndex, 0, mapPoints.Count - 1.001f);
+        int i = Mathf.FloorToInt(seqIndex);
+        float t = seqIndex - i;
+        return Vector3.Lerp(mapPoints[i], mapPoints[i+1], t);
+    }
+
+    void LoadReferenceMap()
+    {
+        mapPoints.Clear();
+        if (!File.Exists(referencesCsvPath)) return;
+        try
+        {
+            string[] lines = File.ReadAllLines(referencesCsvPath);
+            for (int i = 1; i < lines.Length; i++)
+            {
+                string[] parts = lines[i].Split(',');
+                if (parts.Length >= 4)
+                    mapPoints.Add(new Vector3(float.Parse(parts[1]), float.Parse(parts[2]), float.Parse(parts[3])));
+            }
+        }
+        catch {}
+    }
+}

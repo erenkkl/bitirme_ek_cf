@@ -4,11 +4,11 @@ using UnityEngine;
 public class DronePhysics : MonoBehaviour
 {
     [Header("Mod Ayarları")]
-    public bool useGPS = true;
+    public bool useGPS = false;
     public bool autoHover = true;
 
     [Header("Hedefler")]
-    public float targetAltitude = 3.0f;
+    public float targetAltitude = 30.0f;
     private Vector3 savedStationPoint;
 
     [Header("PID Kontrolcüleri")]
@@ -17,19 +17,19 @@ public class DronePhysics : MonoBehaviour
     public PIDController rollPID;
 
     [Header("Yumuşatma Ayarları (Yeni)")]
-    public float yawSpeed = 1.5f;        // Yaw komut kazancı (açı hatasından torka benzer komut üretir)
-    public float turnSmoothness = 2.0f;  // Dönüş yumuşatma (Düşük = daha yumuşak)
-    public float moveSmoothness = 5.0f;  // Pitch/Roll hedef yumuşatma
+    public float yawSpeed = 2.0f;        // Yaw komut kazancı (açı hatasından torka benzer komut üretir)
+    public float turnSmoothness = 8.0f;  // Dönüş yumuşatma (Düşük = daha yumuşak)
+    public float moveSmoothness = 2.0f;  // Pitch/Roll hedef yumuşatma
 
     [Header("Motor Fizik Ayarları")]
-    public float maxThrust = 50f;
-    public float maxTiltAngle = 35f;
+    public float maxThrust = 100f;
+    public float maxTiltAngle = 20f;
     public Transform[] propellers;
     public float visualRotationSpeed = 4000f;
 
     [Header("Stabilite (Önerilen)")]
     [Tooltip("Açısal hız sönümü. Salınımı azaltır. 0.2-1.0 arası tipik.")]
-    public float angularDamping = 0.5f;
+    public float angularDamping = 20.0f;
 
     [Tooltip("Yaw komut limitidir (AddRelativeTorque için).")]
     public float maxYawTorqueCmd = 10f;

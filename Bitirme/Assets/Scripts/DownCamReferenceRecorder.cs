@@ -32,11 +32,11 @@ public class DownCamReferenceRecorder : MonoBehaviour
     public bool useExistingTargetTextureIfPossible = true;
 
     [Header("Output (Single Dataset)")]
-    [Tooltip("Boşsa home altına yazar: ~/bitirme_eren_dataset. Tam yol vermek istersen doldur.")]
+    [Tooltip("Boşsa home altına yazar: ~/bitirme_cetin_dataset. Tam yol vermek istersen doldur.")]
     public string outputBasePathOverride = "";
 
     [Tooltip("Override boşsa, home altında kullanılacak klasör adı.")]
-    public string homeFolderName = "bitirme_eren_dataset";
+    public string homeFolderName = "bitirme_cetin_dataset";
 
     [Tooltip("Play başında images klasörünü temizle.")]
     public bool clearImagesOnStart = true;

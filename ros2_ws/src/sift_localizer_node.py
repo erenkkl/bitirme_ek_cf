@@ -10,267 +10,230 @@ import csv
 import os
 import time
 
-class SiftLocalizerNodeV2(Node):
+# ==========================================
+#        ⚙️ AYARLAR KÖŞESİ (CONFIG) ⚙️
+# ==========================================
+
+# 1. LOGLAMA SIKLIĞI (Saniye)
+# Terminali spamlamamak için kaç saniyede bir log basılsın?
+# 0.0 = Her karede basar (Hızlı)
+# 0.2 = Saniyede 5 kere basar (Okunaklı)
+# 1.0 = Saniyede 1 kere basar (Sakin)
+LOG_INTERVAL = 1.0  
+
+# 2. GÜVEN DOYGUNLUĞU (Confidence Saturation)
+# Kaç tane sağlam nokta (Inlier) bulursak güven %100 (1.0) olsun?
+# Düşük (20) = Çabuk güvenir | Yüksek (60) = Zor beğenir
+CONFIDENCE_SATURATION = 40.0
+
+# 3. ARAMA PENCERESİ (Search Window)
+# Son bulunan konumun +/- kaç kare ötesine bakalım?
+# Küçük (10) = Hızlı ama kaçırabilir | Büyük (50) = Yavaş ama güvenli
+SEARCH_WINDOW = 20
+
+# 4. MİNİMUM EŞLEŞME
+MIN_MATCH_COUNT = 10 
+
+# ==========================================
+
+class SiftLocalizerNode(Node):
     def __init__(self):
         super().__init__('sift_localizer_node')
 
-        # --- Parameters ---
         self.declare_parameter('reference_csv_path', '/home/eren/bitirme_repo/bitirme_dataset/references.csv')
         self.declare_parameter('image_topic', '/drone/camera/bottom')
         self.declare_parameter('pose_topic', '/drone/sift_pose')
-        self.declare_parameter('debug_visualization', False)
-        self.declare_parameter('min_match_count', 10)
-        self.declare_parameter('search_window', 20)  # +/- window size
-        self.declare_parameter('log_every_n', 10)
-        self.declare_parameter('log_match_details', True)
+        self.declare_parameter('debug_viz', False)
 
         self.ref_csv_path = self.get_parameter('reference_csv_path').get_parameter_value().string_value
         self.image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         self.pose_topic = self.get_parameter('pose_topic').get_parameter_value().string_value
-        self.debug_viz = self.get_parameter('debug_visualization').get_parameter_value().bool_value
-        self.min_match_count = self.get_parameter('min_match_count').get_parameter_value().integer_value
-        self.search_window = self.get_parameter('search_window').get_parameter_value().integer_value
-        self.log_every_n = self.get_parameter('log_every_n').get_parameter_value().integer_value
-        self.log_match_details = self.get_parameter('log_match_details').get_parameter_value().bool_value
+        self.show_debug = self.get_parameter('debug_viz').get_parameter_value().bool_value
 
-        # --- SIFT & Matcher Setup ---
-        self.sift = cv2.SIFT_create()
-        # FLANN parameters
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+        # SIFT & Matcher
+        self.sift = cv2.SIFT_create(nfeatures=1000)
+        index_params = dict(algorithm=1, trees=5) 
         search_params = dict(checks=50)
         self.flann = cv2.FlannBasedMatcher(index_params, search_params)
-
         self.bridge = CvBridge()
-        self.reference_database = [] # List of dicts
-        self.last_seq = None
-        self.frame_count = 0
+        
+        self.reference_db = []
+        self.last_seq = 0 
+        
+        # Loglama Zamanlayıcısı
+        self.last_log_time = 0.0
+        
+        # --- BOYUTLAR (V7.6 FIX) ---
+        self.img_w = 320    # Canlı (Küçük) Resim
+        self.img_h = 240
+        self.ref_w = 640    # Referans (Büyük) Resim
+        self.ref_h = 480
 
-        # --- Load Dataset ---
-        self.load_reference_data()
-
-        # --- Subscribers & Publishers ---
-        self.sub = self.create_subscription(Image, self.image_topic, self.image_callback, 10)
+        self.load_reference_db()
+        self.sub = self.create_subscription(Image, self.image_topic, self.image_callback, 1)
         self.pub = self.create_publisher(Float32MultiArray, self.pose_topic, 10)
+        self.get_logger().info(f"SiftLocalizer Started. Log:{LOG_INTERVAL}s | ConfSat:{CONFIDENCE_SATURATION} | Win:{SEARCH_WINDOW}")
 
-        self.get_logger().info("SiftLocalizerNodeV2 started. Waiting for images...")
-
-    def load_reference_data(self):
-        if not os.path.exists(self.ref_csv_path):
-            self.get_logger().error(f"Reference CSV not found: {self.ref_csv_path}")
-            return
-
+    def load_reference_db(self):
+        if not os.path.exists(self.ref_csv_path): return
         dataset_dir = os.path.dirname(self.ref_csv_path)
-        self.get_logger().info(f"Loading dataset from: {dataset_dir}")
-
-        count = 0
         try:
             with open(self.ref_csv_path, 'r') as f:
                 reader = csv.DictReader(f)
-                # Header check: seq,pos_x,pos_y,pos_z,image_rel
-                
                 for row in reader:
-                    try:
-                        seq = int(row['seq'])
-                        x = float(row['pos_x'])
-                        y = float(row['pos_y'])
-                        z = float(row['pos_z'])
-                        image_rel = row['image_rel']
-                        
-                        image_abs = os.path.join(dataset_dir, image_rel)
-
-                        if not os.path.exists(image_abs):
-                            self.get_logger().warn(f"Image missing: {image_abs}")
-                            continue
-
-                        # Load grayscale
-                        img = cv2.imread(image_abs, cv2.IMREAD_GRAYSCALE)
-                        if img is None:
-                            self.get_logger().warn(f"Failed to load image: {image_abs}")
-                            continue
-
-                        # Compute SIFT
-                        kp, des = self.sift.detectAndCompute(img, None)
-
-                        if des is None or len(kp) < 5:
-                            continue
-
-                        # Ensure float32 for FLANN
-                        if des.dtype != np.float32:
-                            des = des.astype(np.float32)
-
-                        ref_entry = {
-                            'seq': seq,
-                            'x': x, 'y': y, 'z': z,
-                            'descriptors': des,
-                            'keypoints': kp, # Optional, kept if needed for viz
-                            'image_rel': image_rel,
-                            'image_abs': image_abs
-                            # 'image': img # Uncomment if needed for deep debug
-                        }
-                        self.reference_database.append(ref_entry)
-                        count += 1
-
-                    except ValueError as e:
-                        self.get_logger().error(f"CSV parsing error on row: {row} -> {e}")
-                        continue
-        except Exception as e:
-            self.get_logger().error(f"Failed to read CSV: {e}")
-            return
-
-        # Sort by seq just in case
-        self.reference_database.sort(key=lambda k: k['seq'])
-        self.get_logger().info(f"Loaded {count} reference frames.")
-
-    def _iter_candidates(self):
-        """Yields reference frames based on search window logic."""
-        total_refs = len(self.reference_database)
-        if total_refs == 0:
-            return
-
-        if self.last_seq is None or self.search_window <= 0:
-            # Full scan
-            for ref in self.reference_database:
-                yield ref
+                    img_path = os.path.join(dataset_dir, row['image_rel'])
+                    if os.path.exists(img_path):
+                        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                        if img is not None:
+                            kp, des = self.sift.detectAndCompute(img, None)
+                            if des is not None and len(kp) > 5:
+                                self.reference_db.append({'seq': int(row['seq']), 'kp': kp, 'des': des.astype(np.float32)})
+        except: pass
+        self.reference_db.sort(key=lambda x: x['seq'])
+        if len(self.reference_db) > 0:
+            first_seq = self.reference_db[0]['seq']
+            last_seq = self.reference_db[-1]['seq']
+            self.get_logger().info(f"Referans gorseller yuklendi: {len(self.reference_db)} Gorsel (Seq: {first_seq} -> {last_seq})")
         else:
-            # Windowed scan
-            # Assumes seq corresponds somewhat to index, but iterating safely is better
-            # Optimally we binary search, but linear scan with check is robust enough for small-medium datasets
-            min_seq = self.last_seq - self.search_window
-            max_seq = self.last_seq + self.search_window
-            
-            candidates_found = 0
-            for ref in self.reference_database:
-                if min_seq <= ref['seq'] <= max_seq:
-                    yield ref
-                    candidates_found += 1
-            
-            # Fallback if track lost (no candidates in window) -> perform full scan
-            if candidates_found == 0:
-                self.last_seq = None # Reset
-                for ref in self.reference_database:
-                    yield ref
+            self.get_logger().error(f"Referans dosyasi bos! Dosya yolu hatali olabilir: {self.ref_csv_path}")
+    def compute_match(self, kp_live, des_live, target_kp, target_des):
+        """MERKEZ İZDÜŞÜMÜ VE HATA HESABI"""
+        if des_live is None or target_des is None: return 0, 0.0, 0.0
+
+        matches = self.flann.knnMatch(des_live, target_des, k=2)
+        good = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance: good.append(m)
+
+        inliers = 0
+        off_x, off_y = 0.0, 0.0
+
+        if len(good) >= 4:
+            src_pts = np.float32([kp_live[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([target_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if M is not None:
+                inliers = np.sum(mask)
+                if inliers > 8:
+                    # 1. CANLI MERKEZ (Küçük)
+                    center_point = np.array([[[self.img_w/2.0, self.img_h/2.0]]], dtype=np.float32)
+                    
+                    # 2. IŞINLAMA
+                    projected_center = cv2.perspectiveTransform(center_point, M)
+                    proj_x = projected_center[0][0][0]
+                    proj_y = projected_center[0][0][1]
+                    
+                    # 3. REFERANS MERKEZİ (Büyük)
+                    ref_center_x = self.ref_w / 2.0
+                    ref_center_y = self.ref_h / 2.0
+                    
+                    # 4. HATA
+                    off_x = proj_x - ref_center_x
+                    off_y = proj_y - ref_center_y
+
+        return inliers, off_x, off_y
+
+    def get_candidates(self):
+        # Arama penceresi parametresini kullan
+        window = SEARCH_WINDOW
+        start = max(0, self.last_seq - window)
+        end = min(len(self.reference_db), self.last_seq + window)
+        return self.reference_db[start:end]
 
     def image_callback(self, msg):
-        start_time = time.time()
-        self.frame_count += 1
-        
-        # 1. Convert Image
+        start_t = time.time() 
+
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        except Exception as e:
-            self.get_logger().error(f"CV Bridge Error: {e}")
-            return
+            cv_img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.ref_h, self.ref_w = cv_img.shape[:2] 
 
-        # 2. SIFT Extraction
-        t0 = time.time()
-        kp_live, des_live = self.sift.detectAndCompute(gray, None)
-        sift_ms = (time.time() - t0) * 1000.0
-
-        if des_live is None or len(kp_live) < self.min_match_count:
-            if self.frame_count % self.log_every_n == 0:
-                self.get_logger().warn("Not enough keypoints in live image.")
-            return
-
-        if des_live.dtype != np.float32:
+            # Resize
+            cv_img_small = cv2.resize(cv_img, (0,0), fx=0.5, fy=0.5)
+            gray = cv2.cvtColor(cv_img_small, cv2.COLOR_BGR2GRAY)
+            self.img_h, self.img_w = cv_img_small.shape[:2] 
+            
+            kp_live, des_live = self.sift.detectAndCompute(gray, None)
+            if des_live is None: return
             des_live = des_live.astype(np.float32)
+        except: return
 
-        # 3. Matching
-        t1 = time.time()
+        # Varsayılanlar
+        pub_seq = -1.0; pub_off_x = 0.0; pub_off_y = 0.0
+        pub_inliers = 0; pub_conf = 0.0
+
         best_match = None
-        max_good_matches = 0
-        candidate_count = 0
+        max_inliers = 0
+        best_offset = (0.0, 0.0)
 
-        for ref in self._iter_candidates():
-            candidate_count += 1
-            # KNN Match
-            matches = self.flann.knnMatch(des_live, ref['descriptors'], k=2)
-            
-            # Ratio Test
-            good_matches = []
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:
-                    good_matches.append(m)
-            
-            count_good = len(good_matches)
-            
-            if count_good > max_good_matches:
-                max_good_matches = count_good
+        # Arama
+        search_list = self.get_candidates()
+        if len(search_list) == 0: search_list = self.reference_db[::5] 
+
+        for ref in search_list:
+            inl, ox, oy = self.compute_match(kp_live, des_live, ref['kp'], ref['des'])
+            if inl > max_inliers:
+                max_inliers = inl
                 best_match = ref
+                best_offset = (ox, oy)
 
-        match_ms = (time.time() - t1) * 1000.0
-
-        # 4. Result Processing
-        confidence = 0.0
-        published = False
-        
-        if best_match and max_good_matches >= self.min_match_count:
-            confidence = min(1.0, max_good_matches / 60.0)
-            
-            # Publish
-            # data = [x, y, z, seq, confidence, match_count]
-            out_msg = Float32MultiArray()
-            out_msg.data = [
-                float(best_match['x']),
-                float(best_match['y']),
-                float(best_match['z']),
-                float(best_match['seq']),
-                float(confidence),
-                float(max_good_matches)
-            ]
-            self.pub.publish(out_msg)
-            
-            # Update tracking
+        if max_inliers >= MIN_MATCH_COUNT:
             self.last_seq = best_match['seq']
-            published = True
-        else:
-            # Lost tracking or poor match
-            if self.search_window > 0:
-                 # Only reset if we were in window mode and failed
-                 # Logic: if best match is terrible, maybe we are totally lost
-                 pass 
-
-        # 5. Logging
-        total_ms = (time.time() - start_time) * 1000.0
-        
-        if self.frame_count % self.log_every_n == 0:
-            status = "PUBLISHED" if published else "REJECTED"
-            best_seq_log = best_match['seq'] if best_match else -1
             
-            self.get_logger().info(
-                f"[{status}] Frame: {self.frame_count} | KPs: {len(kp_live)} | "
-                f"Sift: {sift_ms:.1f}ms | Match: {match_ms:.1f}ms | Tot: {total_ms:.1f}ms | "
-                f"Cands: {candidate_count} | BestSeq: {best_seq_log} | Good: {max_good_matches} | Conf: {confidence:.2f}"
-            )
+            pub_seq = float(self.last_seq)
+            pub_off_x = best_offset[0]
+            pub_off_y = best_offset[1]
+            pub_inliers = max_inliers
+            # Güven Doygunluğu Parametresini Kullan
+            pub_conf = min(1.0, max_inliers / float(CONFIDENCE_SATURATION))
+        else:
+            pub_seq = -1.0
 
-            if published and self.log_match_details:
-                self.get_logger().info(
-                    f"   [MATCHED] live_frame={self.frame_count} -> seq={best_match['seq']} "
-                    f"good={max_good_matches} conf={confidence:.2f} "
-                    f"ref_rel={best_match['image_rel']} ref_abs={best_match['image_abs']}"
-                )
+        # --- YAYIN ---
+        msg_pub = Float32MultiArray()
+        msg_pub.data = [float(pub_seq), float(pub_off_x), float(pub_off_y), float(pub_conf), 0.0, float(pub_inliers)]
+        self.pub.publish(msg_pub)
 
-        # 6. Debug Visualization
-        if self.debug_viz:
-            display_img = cv_image.copy()
-            text = f"Seq: {self.last_seq if self.last_seq else 'None'} | Conf: {confidence:.2f}"
-            color = (0, 255, 0) if published else (0, 0, 255)
-            cv2.putText(display_img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            cv2.imshow("Sift Localizer Debug", display_img)
-            cv2.waitKey(1)
+        # --- LOGLAMA MANTIĞI ---
+        proc_time_ms = (time.time() - start_t) * 1000.0
+        current_time = time.time()
+        
+        if current_time - self.last_log_time > LOG_INTERVAL:
+            self.last_log_time = current_time
+            if pub_seq != -1:
+                self.get_logger().info(f"[MATCH] Seq:{int(pub_seq)} | Inl:{max_inliers} | Conf:{pub_conf:.2f} | Time:{proc_time_ms:.1f}ms")
+            else:
+                self.get_logger().warn(f"[LOST]  No Match | Time:{proc_time_ms:.1f}ms")
+
+        if self.show_debug:
+            self.visualize_debug(cv_img, pub_seq, pub_off_x, pub_inliers, proc_time_ms)
+
+    def visualize_debug(self, img, seq, ox, inl, dt_ms):
+        if seq != -1:
+            txt = f"Seq: {int(seq)} | Inl: {inl}"
+            color = (0, 255, 0)
+            threshold = 5.0
+            if ox < -threshold:
+                cv2.putText(img, "<<< SOLDA", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            elif ox > threshold:
+                cv2.putText(img, "SAGDA >>>", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            else:
+                cv2.putText(img, "MERKEZ", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        else:
+            txt = "LOST"
+            color = (0, 0, 255)
+
+        cv2.putText(img, txt, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(img, f"{dt_ms:.1f} ms", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        cv2.imshow("Sift V8.3 Configurable", img)
+        cv2.waitKey(1)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SiftLocalizerNodeV2()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-        cv2.destroyAllWindows()
+    rclpy.spin(SiftLocalizerNode())
+    rclpy.shutdown()
+    cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
