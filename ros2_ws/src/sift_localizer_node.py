@@ -24,7 +24,7 @@ LOG_INTERVAL = 1.0
 # 2. GÜVEN DOYGUNLUĞU (Confidence Saturation)
 # Kaç tane sağlam nokta (Inlier) bulursak güven %100 (1.0) olsun?
 # Düşük (20) = Çabuk güvenir | Yüksek (60) = Zor beğenir
-CONFIDENCE_SATURATION = 40.0
+CONFIDENCE_SATURATION = 35.0
 
 # 3. ARAMA PENCERESİ (Search Window)
 # Son bulunan konumun +/- kaç kare ötesine bakalım?
@@ -63,7 +63,7 @@ class SiftLocalizerNode(Node):
         # Loglama Zamanlayıcısı
         self.last_log_time = 0.0
         
-        # --- BOYUTLAR (V7.6 FIX) ---
+        
         self.img_w = 320    # Canlı (Küçük) Resim
         self.img_h = 240
         self.ref_w = 640    # Referans (Büyük) Resim

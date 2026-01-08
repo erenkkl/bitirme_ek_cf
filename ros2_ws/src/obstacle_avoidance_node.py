@@ -39,6 +39,17 @@ RECOVERY_ROLL_GAIN = 8.0            # Roll adjustment during recovery - INCREASE
 AVOIDANCE_SPEED_MULT = 0.6          # Speed reduction during avoidance (60%)
 RECOVERY_SPEED_MULT = 0.8           # Speed during recovery (80%)
 
+# Dynamic obstacle parameters
+DYNAMIC_URGENCY_BOOST = 1.3         # Urgency multiplier for approaching dynamic obstacles
+DYNAMIC_ROLL_BOOST = 1.2            # Roll gain boost for fast-approaching obstacles
+APPROACHING_VELOCITY_THRESHOLD = -1.0  # Velocity (m/s) to consider obstacle as "approaching" (negative = closing)
+FAST_APPROACHING_THRESHOLD = -2.5    # Very fast approach threshold for maximum urgency
+
+# Lateral threat parameters (NEW)
+LATERAL_THREAT_URGENCY_BOOST = 1.5   # Extra urgency for side-impact threats
+LATERAL_THREAT_ROLL_BOOST = 1.3      # Extra roll gain for lateral avoidance
+LATERAL_THREAT_TTC_THRESHOLD = 5.0   # Time-to-collision threshold for lateral threats (seconds)
+
 # Timing constraints
 MIN_AVOIDING_DURATION = 2.0         # Min time in AVOIDING before allowing recovery (sec) - INCREASED for thick obstacles
 MIN_RECOVERY_DURATION = 2.0         # Min time in RECOVERING before returning to NORMAL (sec)
@@ -98,6 +109,11 @@ class ObstacleAvoidanceNode(Node):
         self.obstacle_urgency = 0.0
         self.clear_left = 1.0
         self.clear_right = 1.0
+        self.obstacle_velocity = 0.0        # m/s (negative = approaching)
+        self.obstacle_is_dynamic = False    # True if obstacle is moving
+        self.predicted_closest_dist = 100.0 # NEW: Predicted closest approach distance (meters)
+        self.time_to_collision = 100.0      # NEW: Estimated time to closest approach (seconds)
+        self.lateral_threat = False         # NEW: True if side-impact predicted
 
         # SIFT data
         self.sift_seq = -1.0
@@ -153,6 +169,15 @@ class ObstacleAvoidanceNode(Node):
         self.obstacle_urgency = msg.data[3]
         self.clear_left = msg.data[4]
         self.clear_right = msg.data[5]
+
+        # Dynamic obstacle data (indices 6, 7)
+        self.obstacle_velocity = msg.data[6] if len(msg.data) > 6 else 0.0
+        self.obstacle_is_dynamic = msg.data[7] > 0.5 if len(msg.data) > 7 else False
+
+        # NEW: Trajectory prediction data (indices 8, 9, 10)
+        self.predicted_closest_dist = msg.data[8] if len(msg.data) > 8 else 100.0
+        self.time_to_collision = msg.data[9] if len(msg.data) > 9 else 100.0
+        self.lateral_threat = msg.data[10] > 0.5 if len(msg.data) > 10 else False
 
     def sift_callback(self, msg):
         """Receive SIFT localization data"""
@@ -251,6 +276,13 @@ class ObstacleAvoidanceNode(Node):
             if self.has_obstacle and self.obstacle_distance < OBSTACLE_DETECT_RANGE:
                 return AvoidanceState.AVOIDING
 
+            # NEW: If dynamic obstacle moved back into path (approaching again)
+            if (self.has_obstacle and self.obstacle_is_dynamic and
+                self.obstacle_velocity < APPROACHING_VELOCITY_THRESHOLD and
+                self.obstacle_distance < OBSTACLE_CLEARED_RANGE):
+                self.get_logger().warn(f"[RECOVERY] Dynamic obstacle approaching again! Vel:{self.obstacle_velocity:.1f}m/s, returning to AVOIDING")
+                return AvoidanceState.AVOIDING
+
             # Check recovery completion conditions
             avg_confidence = np.mean(self.sift_confidence_history) if len(self.sift_confidence_history) > 0 else 0.0
             avg_error = np.mean(self.visual_error_history) if len(self.visual_error_history) > 0 else 999.0
@@ -332,14 +364,33 @@ class ObstacleAvoidanceNode(Node):
             if self.obstacle_urgency > URGENCY_THRESHOLD:
                 base_roll *= 1.5
 
-            # NEW: If BOTH sides are blocked (thick obstacle), amplify MORE
+            # If BOTH sides are blocked (thick obstacle), amplify MORE
             both_sides_blocked = (self.clear_left < 0.5 and self.clear_right < 0.5)
             if both_sides_blocked:
                 base_roll *= 1.3  # Extra 30% for thick obstacles
                 self.get_logger().info("[AVOIDING] Thick obstacle detected - amplifying avoidance!")
 
+            # NEW: LATERAL THREAT handling (highest priority!)
+            if self.lateral_threat and self.time_to_collision < LATERAL_THREAT_TTC_THRESHOLD:
+                base_roll *= LATERAL_THREAT_ROLL_BOOST
+                command['speed_multiplier'] = AVOIDANCE_SPEED_MULT * 0.7  # Slow down more (42%)
+                self.get_logger().warn(f"⚠️ [AVOIDING] LATERAL THREAT! TTC:{self.time_to_collision:.1f}s - aggressive side avoidance!")
+
+            # Dynamic obstacle handling (if not already lateral threat)
+            elif self.obstacle_is_dynamic:
+                # Boost for approaching obstacles
+                if self.obstacle_velocity < APPROACHING_VELOCITY_THRESHOLD:
+                    base_roll *= DYNAMIC_URGENCY_BOOST
+                    self.get_logger().info(f"[AVOIDING] Dynamic obstacle approaching at {self.obstacle_velocity:.1f}m/s - boosting avoidance!")
+
+                # Extra boost for fast-approaching obstacles
+                if self.obstacle_velocity < FAST_APPROACHING_THRESHOLD:
+                    base_roll *= DYNAMIC_ROLL_BOOST
+                    command['speed_multiplier'] = AVOIDANCE_SPEED_MULT * 0.8  # Slow down more (48%)
+                    self.get_logger().warn(f"[AVOIDING] FAST approaching obstacle! Vel:{self.obstacle_velocity:.1f}m/s - maximum avoidance!")
+
             command['roll_adjustment'] = base_roll
-            command['speed_multiplier'] = AVOIDANCE_SPEED_MULT
+            command['speed_multiplier'] = command.get('speed_multiplier', AVOIDANCE_SPEED_MULT)  # Use modified speed if set
             command['look_ahead_multiplier'] = 1.0
 
         # ========== RECOVERING MODE ==========
@@ -412,7 +463,10 @@ class ObstacleAvoidanceNode(Node):
 
         elif self.current_state == AvoidanceState.AVOIDING:
             side = self.get_side_name(self.preferred_side)
-            self.get_logger().info(f"[{state_name}] Avoiding {side} | Dist: {self.obstacle_distance:.1f}m | Urg: {self.obstacle_urgency:.2f} | ClearL:{self.clear_left:.2f} ClearR:{self.clear_right:.2f}")
+            type_str = "DYNAMIC" if self.obstacle_is_dynamic else "STATIC"
+            vel_str = f"Vel:{self.obstacle_velocity:.1f}m/s" if self.obstacle_is_dynamic else ""
+            lateral_str = f"⚠️LATERAL TTC:{self.time_to_collision:.1f}s" if self.lateral_threat else ""
+            self.get_logger().info(f"[{state_name}] {type_str} {vel_str} {lateral_str} | Avoiding {side} | Dist: {self.obstacle_distance:.1f}m | Urg: {self.obstacle_urgency:.2f} | ClearL:{self.clear_left:.2f} ClearR:{self.clear_right:.2f}")
 
         elif self.current_state == AvoidanceState.RECOVERING:
             avg_conf = np.mean(self.sift_confidence_history) if len(self.sift_confidence_history) > 0 else 0.0

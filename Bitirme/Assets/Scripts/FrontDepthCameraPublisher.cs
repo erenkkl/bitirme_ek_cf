@@ -256,6 +256,10 @@ public class FrontDepthCameraPublisher : MonoBehaviour
 
     private void OnReadbackComplete(AsyncGPUReadbackRequest req)
     {
+        // Check if component has been destroyed before accessing any members
+        if (this == null)
+            return;
+
         requestInFlight = false;
 
         if (!enabled || req.hasError)
