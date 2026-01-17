@@ -16,7 +16,7 @@ import threading
 # ==========================================
 
 LOG_INTERVAL = 3.0
-CONFIDENCE_SATURATION = 35.0
+CONFIDENCE_SATURATION = 60.0
 SEARCH_WINDOW_FORWARD = 15   # MAP mode: search ahead (drone moving forward)
 SEARCH_WINDOW_BACKWARD = 10  # MAP mode: search behind
 MIN_MATCH_COUNT = 10
