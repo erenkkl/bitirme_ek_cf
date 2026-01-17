@@ -10,6 +10,7 @@ public class SiftPathFollower : MonoBehaviour
     private enum MissionState
     {
         FLYING,
+        AVOIDANCE,
         ARRIVED,
         LANDING,
         COMPLETED
@@ -165,6 +166,10 @@ public class SiftPathFollower : MonoBehaviour
                 HandleFlyingState();
                 break;
 
+            case MissionState.AVOIDANCE:
+                HandleAvoidanceState();
+                break;
+
             case MissionState.ARRIVED:
                 HandleArrivedState();
                 break;
@@ -181,34 +186,25 @@ public class SiftPathFollower : MonoBehaviour
 
     private void HandleFlyingState()
     {
+        // Check if avoidance should take over
+        if (enableAvoidance && avoidanceActive && avoidanceMode != 0)
+        {
+            currentState = MissionState.AVOIDANCE;
+            Debug.Log($"[SiftPathFollower] Obstacle detected. Transitioning to AVOIDANCE state (mode: {avoidanceMode}).");
+            return;
+        }
+
         // --- 1. LOST DURUMU ---
         if (estimatedSeq == -1 || rawSeq == -1)
         {
-            // NEW: If avoidance is active (especially RECOVERING), keep executing recovery commands
-            // This helps drone return to path where SIFT can reacquire
-            if (enableAvoidance && avoidanceActive && avoidanceMode == 2) // RECOVERING mode
-            {
-                // Continue with recovery commands even when SIFT lost
-                // This allows drone to fly back toward path to reacquire SIFT
-                if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
-                {
-                    lastLogTime = Time.time;
-                    Debug.LogWarning("[LOST+RECOVERING] SIFT lost but continuing recovery to reacquire path...");
-                }
-                // Don't return - continue to apply avoidance recovery commands below
-            }
-            else
-            {
-                // Not in recovery - safe to stop
-                drone.SetExternalCommand(0, 0, 0);
+            drone.SetExternalCommand(0, 0, 0);
 
-                if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
-                {
-                    lastLogTime = Time.time;
-                    Debug.LogWarning("[LOST] Harita Kayip! Bekleniyor...");
-                }
-                return;
+            if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
+            {
+                lastLogTime = Time.time;
+                Debug.LogWarning("[LOST] Harita Kayip! Bekleniyor...");
             }
+            return;
         }
 
         float pitchCmd = 0;
@@ -217,50 +213,157 @@ public class SiftPathFollower : MonoBehaviour
         string stateTag = "FLYING";
         string dirStr = "MERKEZ";
 
-        // --- AVOIDANCE INTEGRATION ---
-        // Smooth avoidance roll transitions
-        if (enableAvoidance && avoidanceActive)
+        // Smoothly return avoidance roll to zero when in FLYING state
+        currentAvoidanceRoll = Mathf.Lerp(currentAvoidanceRoll, 0f, Time.fixedDeltaTime * avoidanceSmoothness);
+        lookAhead = baseLookAhead; // Reset to base
+
+        // --- 2. HESAPLAMALAR ---
+        // Normal SIFT-based navigation
+
+        // Deadband & Yön Etiketi
+        if (Mathf.Abs(visualErrX) > deadband)
         {
-            currentAvoidanceRoll = Mathf.Lerp(currentAvoidanceRoll, avoidanceRollAdjustment,
-                                               Time.fixedDeltaTime * avoidanceSmoothness);
-
-            // Update look-ahead dynamically
-            lookAhead = baseLookAhead * avoidanceLookAheadMult;
-
-            // Update state tag for logging
-            if (avoidanceMode == 1)
-                stateTag = "AVOIDING";
-            else if (avoidanceMode == 2)
-                stateTag = "RECOVERING";
-            else if (avoidanceMode == 3)
-                stateTag = "EMERGENCY";
+            if (visualErrX > 0)
+            {
+                effectiveErrorX = visualErrX - deadband;
+                dirStr = "SAG (>>)";
+            }
+            else
+            {
+                effectiveErrorX = visualErrX + deadband;
+                dirStr = "SOL (<<)";
+            }
         }
         else
         {
-            // Smoothly return to zero when avoidance deactivates
-            currentAvoidanceRoll = Mathf.Lerp(currentAvoidanceRoll, 0f, Time.fixedDeltaTime * avoidanceSmoothness);
-            lookAhead = baseLookAhead; // Reset to base
+            effectiveErrorX = 0;
+            dirStr = "MERKEZ";
         }
 
-        // --- 2. HESAPLAMALAR ---
+        // Roll Komutu
+        rollCmd = effectiveErrorX * visualGainX;
+        if (invertRoll) rollCmd = -rollCmd;
 
-        // NEW: If SIFT lost but in RECOVERING mode, provide basic movement to help reacquire
+        // ARRIVED Kontrolü & State Transition
+        if (estimatedSeq >= mapPoints.Count - lookAhead)
+        {
+            stateTag = "ARRIVED";
+            pitchCmd = 0;
+
+            // Transition to ARRIVED state
+            currentState = MissionState.ARRIVED;
+            Debug.Log("[SiftPathFollower] Mission target reached. Transitioning to ARRIVED state.");
+        }
+        else
+        {
+            pitchCmd = forwardSpeed;
+        }
+
+        // Yaw Komutu
+        Vector3 virtualPos = GetInterpolatedPoint(estimatedSeq);
+        Vector3 targetPos = GetInterpolatedPoint(estimatedSeq + lookAhead);
+        Vector3 pathVec = targetPos - virtualPos;
+
+        if (pathVec.sqrMagnitude > 0.01f)
+        {
+            float targetHead = Mathf.Atan2(pathVec.x, pathVec.z) * Mathf.Rad2Deg;
+            float currentYaw = transform.eulerAngles.y;
+            float yawErr = Mathf.DeltaAngle(currentYaw, targetHead);
+            yawCmd = Mathf.Clamp(yawErr * yawGain, -drone.maxYawTorqueCmd, drone.maxYawTorqueCmd);
+        }
+
+        // Komutları Uygula
+        rollCmd = Mathf.Clamp(rollCmd, -20f, 20f);
+        drone.SetExternalCommand(pitchCmd, rollCmd, yawCmd);
+
+        // --- 3. LOGLAMA ---
+        if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
+        {
+            lastLogTime = Time.time;
+            float targetSeq = estimatedSeq + lookAhead;
+            Debug.Log($"[{stateTag}] Seq:{estimatedSeq:F0} > Target:{targetSeq:F0} | {dirStr} Err:{visualErrX:F1} | Cmd:(P{pitchCmd:F0}, R{rollCmd:F1})");
+        }
+    }
+
+    private void HandleAvoidanceState()
+    {
+        // Check if avoidance is complete (mode returned to NORMAL)
+        if (!avoidanceActive || avoidanceMode == 0)
+        {
+            currentState = MissionState.FLYING;
+            Debug.Log("[SiftPathFollower] Avoidance complete. Returning to FLYING state.");
+            return;
+        }
+
+        float pitchCmd = 0;
+        float rollCmd = 0;
+        float yawCmd = 0;
+        string stateTag = "AVOIDANCE";
+        string dirStr = "MERKEZ";
+
+        // Smooth avoidance roll transitions
+        currentAvoidanceRoll = Mathf.Lerp(currentAvoidanceRoll, avoidanceRollAdjustment,
+                                           Time.fixedDeltaTime * avoidanceSmoothness);
+
+        // Update look-ahead dynamically
+        lookAhead = baseLookAhead * avoidanceLookAheadMult;
+
+        // Update state tag for logging
+        if (avoidanceMode == 1)
+            stateTag = "AVOIDING";
+        else if (avoidanceMode == 2)
+            stateTag = "RECOVERING";
+        else if (avoidanceMode == 3)
+            stateTag = "EMERGENCY";
+
+        // Check SIFT status
         bool siftLost = (estimatedSeq == -1 || rawSeq == -1);
 
-        if (siftLost && enableAvoidance && avoidanceActive && avoidanceMode == 2)
+        if (siftLost)
         {
-            // SIFT lost during recovery - use simple forward motion
-            // Roll will be controlled by avoidance commands below
-            pitchCmd = forwardSpeed * avoidanceSpeedMultiplier; // Keep moving forward slowly
-            rollCmd = 0; // Will be overridden by avoidance blend
-            yawCmd = 0; // Maintain current heading
+            // SIFT lost during avoidance - continue with avoidance commands
+            if (avoidanceMode == 2) // RECOVERING mode
+            {
+                // Keep moving forward slowly to help reacquire SIFT
+                pitchCmd = forwardSpeed * avoidanceSpeedMultiplier;
+                stateTag = "RECOVERING-BLIND";
+                dirStr = "NO-SIFT";
 
-            stateTag = "RECOVERING-BLIND";
-            dirStr = "NO-SIFT";
+                if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
+                {
+                    lastLogTime = Time.time;
+                    Debug.LogWarning("[LOST+RECOVERING] SIFT lost but continuing recovery to reacquire path...");
+                }
+            }
+            else if (avoidanceMode == 3) // EMERGENCY STOP
+            {
+                // Emergency: stop completely
+                pitchCmd = 0;
+                rollCmd = 0;
+                yawCmd = 0;
+                drone.SetExternalCommand(pitchCmd, rollCmd, yawCmd);
+
+                if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
+                {
+                    lastLogTime = Time.time;
+                    Debug.LogWarning("[EMERGENCY] SIFT lost during emergency stop.");
+                }
+                return;
+            }
+            else
+            {
+                // AVOIDING mode with SIFT lost - continue avoidance maneuver
+                pitchCmd = forwardSpeed * avoidanceSpeedMultiplier;
+                stateTag = "AVOIDING-BLIND";
+                dirStr = "NO-SIFT";
+            }
+
+            // Apply avoidance roll directly (no SIFT blending)
+            rollCmd = currentAvoidanceRoll;
         }
-        else if (!siftLost)
+        else
         {
-            // Normal SIFT-based navigation
+            // SIFT is available - blend SIFT correction with avoidance
 
             // Deadband & Yön Etiketi
             if (Mathf.Abs(visualErrX) > deadband)
@@ -282,30 +385,22 @@ public class SiftPathFollower : MonoBehaviour
                 dirStr = "MERKEZ";
             }
 
-            // Roll Komutu
-            rollCmd = effectiveErrorX * visualGainX;
-            if (invertRoll) rollCmd = -rollCmd;
+            // SIFT Roll Komutu
+            float siftRoll = effectiveErrorX * visualGainX;
+            if (invertRoll) siftRoll = -siftRoll;
 
-            // ARRIVED Kontrolü & State Transition
+            // ARRIVED Kontrolü (even during avoidance, check if we reached destination)
             if (estimatedSeq >= mapPoints.Count - lookAhead)
             {
                 stateTag = "ARRIVED";
                 pitchCmd = 0;
-
-                // Transition to ARRIVED state
                 currentState = MissionState.ARRIVED;
-                Debug.Log("[SiftPathFollower] Mission target reached. Transitioning to ARRIVED state.");
+                Debug.Log("[SiftPathFollower] Mission target reached during avoidance. Transitioning to ARRIVED state.");
+                return;
             }
-            else
-            {
-                // Apply speed multiplier from avoidance (if active)
-                float baseSpeed = forwardSpeed;
-                if (enableAvoidance && avoidanceActive)
-                {
-                    baseSpeed *= avoidanceSpeedMultiplier;
-                }
-                pitchCmd = baseSpeed;
-            }
+
+            // Apply speed multiplier from avoidance
+            pitchCmd = forwardSpeed * avoidanceSpeedMultiplier;
 
             // Yaw Komutu
             Vector3 virtualPos = GetInterpolatedPoint(estimatedSeq);
@@ -319,13 +414,8 @@ public class SiftPathFollower : MonoBehaviour
                 float yawErr = Mathf.DeltaAngle(currentYaw, targetHead);
                 yawCmd = Mathf.Clamp(yawErr * yawGain, -drone.maxYawTorqueCmd, drone.maxYawTorqueCmd);
             }
-        }
 
-        // --- BLEND SIFT + AVOIDANCE ROLL ---
-        if (enableAvoidance && avoidanceActive)
-        {
             // Blend SIFT correction with avoidance command
-            float siftRoll = rollCmd;
             float blendedRoll = 0f;
 
             if (avoidanceMode == 1) // AVOIDING
@@ -342,11 +432,7 @@ public class SiftPathFollower : MonoBehaviour
             {
                 // Emergency: zero roll, just stop
                 blendedRoll = 0f;
-                pitchCmd = 0f; // Override pitch too
-            }
-            else // NORMAL (shouldn't happen if avoidanceActive, but safe fallback)
-            {
-                blendedRoll = siftRoll;
+                pitchCmd = 0f;
             }
 
             rollCmd = blendedRoll;
@@ -356,21 +442,13 @@ public class SiftPathFollower : MonoBehaviour
         rollCmd = Mathf.Clamp(rollCmd, -20f, 20f);
         drone.SetExternalCommand(pitchCmd, rollCmd, yawCmd);
 
-        // --- 3. LOGLAMA ---
+        // --- LOGLAMA ---
         if (debugLogs && Time.time - lastLogTime > debugLogPeriod)
         {
             lastLogTime = Time.time;
             float targetSeq = estimatedSeq + lookAhead;
-
-            if (enableAvoidance && avoidanceActive)
-            {
-                Debug.Log($"[{stateTag}] Seq:{estimatedSeq:F0} > Target:{targetSeq:F0} | {dirStr} Err:{visualErrX:F1} | " +
-                          $"AvoidRoll:{currentAvoidanceRoll:F1}° SpeedMult:{avoidanceSpeedMultiplier:F2} | Cmd:(P{pitchCmd:F0}, R{rollCmd:F1})");
-            }
-            else
-            {
-                Debug.Log($"[{stateTag}] Seq:{estimatedSeq:F0} > Target:{targetSeq:F0} | {dirStr} Err:{visualErrX:F1} | Cmd:(P{pitchCmd:F0}, R{rollCmd:F1})");
-            }
+            Debug.Log($"[{stateTag}] Seq:{estimatedSeq:F0} > Target:{targetSeq:F0} | {dirStr} Err:{visualErrX:F1} | " +
+                      $"AvoidRoll:{currentAvoidanceRoll:F1}° SpeedMult:{avoidanceSpeedMultiplier:F2} | Cmd:(P{pitchCmd:F0}, R{rollCmd:F1})");
         }
     }
 

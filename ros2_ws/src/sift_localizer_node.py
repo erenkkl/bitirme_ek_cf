@@ -36,9 +36,9 @@ MIN_MATCH_COUNT = 10
 
 # ==========================================
 
-class SiftLocalizerNode(Node):
+class OrbLocalizerNode(Node):
     def __init__(self):
-        super().__init__('sift_localizer_node')
+        super().__init__('orb_localizer_node')
 
         self.declare_parameter('reference_csv_path', '/home/eren/bitirme_repo/bitirme_dataset/references.csv')
         self.declare_parameter('image_topic', '/drone/camera/bottom')
@@ -50,11 +50,9 @@ class SiftLocalizerNode(Node):
         self.pose_topic = self.get_parameter('pose_topic').get_parameter_value().string_value
         self.show_debug = self.get_parameter('debug_viz').get_parameter_value().bool_value
 
-        # SIFT & Matcher
-        self.sift = cv2.SIFT_create(nfeatures=1000)
-        index_params = dict(algorithm=1, trees=5) 
-        search_params = dict(checks=50)
-        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
+        # ORB & Matcher
+        self.orb = cv2.ORB_create(nfeatures=2000)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self.bridge = CvBridge()
         
         self.reference_db = []
@@ -72,7 +70,7 @@ class SiftLocalizerNode(Node):
         self.load_reference_db()
         self.sub = self.create_subscription(Image, self.image_topic, self.image_callback, 1)
         self.pub = self.create_publisher(Float32MultiArray, self.pose_topic, 10)
-        self.get_logger().info(f"SiftLocalizer Started. Log:{LOG_INTERVAL}s | ConfSat:{CONFIDENCE_SATURATION} | Win:{SEARCH_WINDOW}")
+        self.get_logger().info(f"OrbLocalizer Started. Log:{LOG_INTERVAL}s | ConfSat:{CONFIDENCE_SATURATION} | Win:{SEARCH_WINDOW}")
 
     def load_reference_db(self):
         if not os.path.exists(self.ref_csv_path): return
@@ -85,9 +83,9 @@ class SiftLocalizerNode(Node):
                     if os.path.exists(img_path):
                         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
                         if img is not None:
-                            kp, des = self.sift.detectAndCompute(img, None)
+                            kp, des = self.orb.detectAndCompute(img, None)
                             if des is not None and len(kp) > 5:
-                                self.reference_db.append({'seq': int(row['seq']), 'kp': kp, 'des': des.astype(np.float32)})
+                                self.reference_db.append({'seq': int(row['seq']), 'kp': kp, 'des': des})
         except: pass
         self.reference_db.sort(key=lambda x: x['seq'])
         if len(self.reference_db) > 0:
@@ -100,7 +98,7 @@ class SiftLocalizerNode(Node):
         """MERKEZ İZDÜŞÜMÜ VE HATA HESABI"""
         if des_live is None or target_des is None: return 0, 0.0, 0.0
 
-        matches = self.flann.knnMatch(des_live, target_des, k=2)
+        matches = self.matcher.knnMatch(des_live, target_des, k=2)
         good = []
         for m, n in matches:
             if m.distance < 0.75 * n.distance: good.append(m)
@@ -153,9 +151,8 @@ class SiftLocalizerNode(Node):
             gray = cv2.cvtColor(cv_img_small, cv2.COLOR_BGR2GRAY)
             self.img_h, self.img_w = cv_img_small.shape[:2] 
             
-            kp_live, des_live = self.sift.detectAndCompute(gray, None)
+            kp_live, des_live = self.orb.detectAndCompute(gray, None)
             if des_live is None: return
-            des_live = des_live.astype(np.float32)
         except: return
 
         # Varsayılanlar
@@ -226,12 +223,12 @@ class SiftLocalizerNode(Node):
         cv2.putText(img, txt, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         cv2.putText(img, f"{dt_ms:.1f} ms", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
-        cv2.imshow("Sift V8.3 Configurable", img)
+        cv2.imshow("Orb Localizer", img)
         cv2.waitKey(1)
 
 def main(args=None):
     rclpy.init(args=args)
-    rclpy.spin(SiftLocalizerNode())
+    rclpy.spin(OrbLocalizerNode())
     rclpy.shutdown()
     cv2.destroyAllWindows()
 
